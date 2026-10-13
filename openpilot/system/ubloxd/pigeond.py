@@ -167,26 +167,48 @@ def init_baudrate(pigeon: TTYPigeon):
   pigeon.set_baud(460800)
 
 
+def send_time(pigeon: TTYPigeon) -> None:
+  t_now = datetime.now(UTC).replace(tzinfo=None)
+  cloudlog.warning("Sending current time to ublox")
+
+  # UBX-MGA-INI-TIME_UTC
+  msg = add_ubx_checksum(b"\xB5\x62\x13\x40\x18\x00" + struct.pack("<BBBBHBBBBBxIHxxI",
+    0x10,
+    0x00,
+    0x00,
+    0x80,
+    t_now.year,
+    t_now.month,
+    t_now.day,
+    t_now.hour,
+    t_now.minute,
+    t_now.second,
+    0,
+    30,
+    0
+  ))
+  pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
+
+
 def send_position(pigeon: TTYPigeon) -> None:
-  if not system_time_valid() or not (position := Params().get("LastGPSPosition")):
+  if not (position := Params().get("LastGPSPosition")):
     return
 
-  try:
-    with log.Event.from_bytes(position) as evt:
-      gps = evt.gpsLocationExternal
-      if time.time() - gps.unixTimestampMillis / 1000 > 7 * 24 * 3600:
-        return
-      # UBX-MGA-INI-POS_LLH
-      msg = add_ubx_checksum(b"\xB5\x62\x13\x40\x14\x00" + struct.pack("<BB2xiiiI",
-        0x01, 0x00,
-        round(gps.latitude * 1e7),
-        round(gps.longitude * 1e7),
-        round(gps.altitude * 100),
-        100_000 * 100,  # allow for movement since the last fix
-      ))
-    pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
-  except Exception:
-    cloudlog.exception("failed to send last GPS position")
+  with log.Event.from_bytes(position) as evt:
+    gps = evt.gpsLocationExternal
+    if time.time() - gps.unixTimestampMillis / 1000 > 7 * 24 * 3600:
+      return
+    cloudlog.warning("Sending last position to ublox")
+
+    # UBX-MGA-INI-POS_LLH
+    msg = add_ubx_checksum(b"\xB5\x62\x13\x40\x14\x00" + struct.pack("<BB2xiiiI",
+      0x01, 0x00,
+      round(gps.latitude * 1e7),
+      round(gps.longitude * 1e7),
+      round(gps.altitude * 100),
+      100_000 * 100,  # allow for movement since the last fix
+    ))
+  pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
 
 
 def init_pigeon(pigeon: TTYPigeon) -> bool:
@@ -239,29 +261,6 @@ def init_pigeon(pigeon: TTYPigeon) -> bool:
       else:
         cloudlog.error(f"failed to restore almanac backup, status: {restore_status}")
 
-      # sending time to ublox
-      if system_time_valid():
-        t_now = datetime.now(UTC).replace(tzinfo=None)
-        cloudlog.warning("Sending current time to ublox")
-
-        # UBX-MGA-INI-TIME_UTC
-        msg = add_ubx_checksum(b"\xB5\x62\x13\x40\x18\x00" + struct.pack("<BBBBHBBBBBxIHxxI",
-          0x10,
-          0x00,
-          0x00,
-          0x80,
-          t_now.year,
-          t_now.month,
-          t_now.day,
-          t_now.hour,
-          t_now.minute,
-          t_now.second,
-          0,
-          30,
-          0
-        ))
-        pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
-
       cloudlog.warning("Pigeon GPS on!")
       break
     except TimeoutError:
@@ -291,8 +290,7 @@ def init(pigeon: TTYPigeon) -> None:
   time.sleep(0.5)
 
   init_baudrate(pigeon)
-  if init_pigeon(pigeon):
-    send_position(pigeon)
+  init_pigeon(pigeon)
 
 def run_receiving(duration: int = 0):
   pm = messaging.PubMaster(['ubloxRaw'])
@@ -302,6 +300,7 @@ def run_receiving(duration: int = 0):
 
   start_time = time.monotonic()
   last_almanac_save = time.monotonic()
+  init_aiding_attempted = False
   assist_attempted = False
   assist_messages = None
 
@@ -319,6 +318,15 @@ def run_receiving(duration: int = 0):
   threading.Thread(target=download_assistnow, daemon=True).start()
 
   while (duration == 0) or (time.monotonic() - start_time < duration):
+    # time must come first, position and AssistNow data are useless without it
+    if system_time_valid() and not init_aiding_attempted:
+      init_aiding_attempted = True
+      try:
+        send_time(pigeon)
+        send_position(pigeon)
+      except Exception:
+        cloudlog.exception("failed to send time and position to ublox")
+
     if assist_messages is not None and not assist_attempted:
       assist_attempted = True
       try:
@@ -333,6 +341,7 @@ def run_receiving(duration: int = 0):
       if dat[0] == 0x00:
         cloudlog.warning("received invalid data from ublox, re-initing!")
         init(pigeon)
+        init_aiding_attempted = False
         assist_attempted = False
         continue
 
